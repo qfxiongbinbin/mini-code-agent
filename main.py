@@ -18,6 +18,7 @@ WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", DEFAULT_WORKSPACE)).resolve()
 MODEL = os.environ.get("MODEL", "glm-5")
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "8"))
 THINKING_TYPE = os.environ.get("THINKING_TYPE", "enabled").strip().lower()
+DEBUG = os.environ.get("DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 BASE_URL = os.environ.get("BASE_URL") or {
     "zhipu": "https://open.bigmodel.cn/api/paas/v4/",
     "minimax": "https://api.minimaxi.com/v1",
@@ -41,6 +42,22 @@ Rules:
 """.strip()
 
 TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path, relative or absolute."},
+                    "max_depth": {"type": "integer", "description": "Maximum depth to list, default is 3."},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -125,9 +142,21 @@ class LocalTools:
                 return self.write_file(args["path"], args["content"])
             if name == "run_command":
                 return self.run_command(args["command"])
+            if name == "list_files":
+                return self.list_files(args["path"], args.get("max_depth", 3))
             return {"ok": False, "error": f"unknown tool: {name}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+    
+    def list_files(self, path: str, max_depth: int = 3) -> dict[str, Any]:
+        path = self.resolve_path(path)
+        if not path.is_dir():
+            return {"ok": False, "error": f"directory not found: {path}"}
+        result = subprocess.run(
+            ["find", path, "-maxdepth", str(max_depth), "-type", "f"],
+            capture_output=True,
+        )
+        return {"ok": True, "files": [line.decode() for line in result.stdout.splitlines()]}
 
     def resolve_path(self, raw_path: str) -> Path:
         path = Path(raw_path)
@@ -214,6 +243,26 @@ class Agent:
             options["extra_body"] = {"reasoning_split": True}
         return options
 
+    def _debug(self, title: str, data: Any) -> None:
+        if not DEBUG:
+            return
+        print(f"\n[debug] {title}")
+        if isinstance(data, str):
+            print(data)
+            return
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+
+    def _summarize_tool_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {"ok": result.get("ok")}
+        for key in ("path", "bytes", "returncode", "command", "error"):
+            if key in result:
+                summary[key] = result[key]
+        for key in ("stdout", "stderr", "content", "matches"):
+            value = result.get(key)
+            if value:
+                summary[key] = value[:500]
+        return summary
+
     def run(self, task: str, max_steps: int = MAX_STEPS) -> str:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -221,6 +270,15 @@ class Agent:
         ]
 
         for step in range(1, max_steps + 1):
+            self._debug(
+                f"request step {step}",
+                {
+                    "provider": self.provider,
+                    "model": self.model,
+                    "message_count": len(messages),
+                    "request_options": self._request_options(),
+                },
+            )
             response = self.client.chat.completions.create(
                 messages=messages,
                 **self._request_options(),
@@ -228,6 +286,10 @@ class Agent:
             message = response.choices[0].message
             assistant_message = message.model_dump(exclude_none=True)
             messages.append(assistant_message)
+            self._debug(f"assistant raw step {step}", assistant_message)
+
+            if message.content:
+                self._debug(f"assistant text step {step}", message.content)
 
             tool_calls = message.tool_calls or []
             if not tool_calls:
@@ -237,8 +299,17 @@ class Agent:
             for call in tool_calls:
                 args = json.loads(call.function.arguments)
                 print(f"- tool: {call.function.name} {args}")
+                self._debug(
+                    f"tool call step {step}",
+                    {
+                        "id": call.id,
+                        "name": call.function.name,
+                        "arguments": args,
+                    },
+                )
                 result = self.tools.call(call.function.name, args)
                 print(f"  result ok={result.get('ok')}")
+                self._debug(f"tool result step {step}", self._summarize_tool_result(result))
                 messages.append(
                     {
                         "role": "tool",
@@ -269,6 +340,7 @@ def main() -> int:
     print(f"workspace: {WORKSPACE}")
     print(f"model: {MODEL}")
     print(f"task: {task}")
+    print(f"debug: {DEBUG}")
 
     final_answer = agent.run(task)
     print("\n[final answer]")
